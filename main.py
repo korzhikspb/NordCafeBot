@@ -43,6 +43,19 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
 # -----------------------------
+# ФОРМАТЫ ДАТ/ВРЕМЕНИ
+# -----------------------------
+ISO_FMT = "%Y-%m-%d %H:%M"   # как хранится в БД
+DISP_FMT = "%H:%M %d.%m"     # как показываем пользователю (без года)
+
+def iso_to_disp(iso_str: str) -> str:
+    """YYYY-MM-DD HH:MM -> HH:MM DD.MM"""
+    try:
+        return datetime.strptime(iso_str, ISO_FMT).strftime(DISP_FMT)
+    except Exception:
+        return iso_str  # на всякий случай, если формат неожиданный
+
+# -----------------------------
 # ТЕКСТЫ КНОПОК
 # -----------------------------
 BTN_EVENTS = "📅 Список мероприятий"
@@ -50,6 +63,7 @@ BTN_MYREGS = "📝 Мои записи"
 BTN_BACK   = "⬅️ Назад"
 BTN_CANCEL = "❌ Отмена"
 BTN_SEND_PHONE = "📱 Отправить номер"
+BTN_SEND_USERNAME = "👤 Отправить юзернейм"
 
 # -----------------------------
 # CALLBACK PREFIXES
@@ -62,14 +76,13 @@ CB_CANCEL_REG = "cancel"   # cancel:<event_id> — отмена записи
 # -----------------------------
 # "Состояния" простыми словарями
 # -----------------------------
-STEP_EVENT, STEP_NAME, STEP_PHONE = range(3)
+STEP_EVENT, STEP_NAME, STEP_SEATS, STEP_PHONE = range(4)
 ADMIN_ADD_TITLE, ADMIN_ADD_DATETIME, ADMIN_ADD_PLACE, ADMIN_ADD_DESC = range(4)
 ADMIN_DEL_WAIT_ID, ADMIN_DEL_CONFIRM = range(2)
 
 user_states = {}    # per-user: запись на событие
 add_states = {}     # per-admin: добавление события
 delete_states = {}  # per-admin: удаление события
-
 
 # -----------------------------
 # КЛАВИАТУРЫ
@@ -94,7 +107,14 @@ def back_cancel_kb() -> ReplyKeyboardMarkup:
 
 def phone_request_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    kb.add(KeyboardButton(BTN_SEND_PHONE, request_contact=True))
+    kb.row(KeyboardButton(BTN_SEND_PHONE, request_contact=True),
+           KeyboardButton(BTN_SEND_USERNAME))
+    kb.add(KeyboardButton(BTN_BACK), KeyboardButton(BTN_CANCEL))
+    return kb
+
+def seats_kb() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.row(KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3"), KeyboardButton("4"))
     kb.add(KeyboardButton(BTN_BACK), KeyboardButton(BTN_CANCEL))
     return kb
 
@@ -102,7 +122,7 @@ def events_inline_kb(events) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     for ev in events:
         ev_id, name, desc, dt, place = ev
-        title = f"{name} • {dt}"
+        title = f"{name} • {iso_to_disp(dt)}"
         kb.add(InlineKeyboardButton(title, callback_data=f"{CB_EVENT}:{ev_id}"))
     return kb
 
@@ -117,7 +137,6 @@ def myregs_back_kb() -> ReplyKeyboardMarkup:
     kb.add(KeyboardButton(BTN_BACK))
     return kb
 
-
 # -----------------------------
 # HELPERS
 # -----------------------------
@@ -127,6 +146,13 @@ def reset_user_state(user_id: int):
 def reset_admin_states(user_id: int):
     add_states.pop(user_id, None)
     delete_states.pop(user_id, None)
+
+def reg_seats_safe(reg_tuple) -> int:
+    """Достаёт seats из кортежа регистрации (если есть), иначе 1."""
+    try:
+        return int(reg_tuple[3])
+    except Exception:
+        return 1
 
 async def show_events_list(target) -> None:
     """
@@ -141,7 +167,7 @@ async def show_events_list(target) -> None:
         uid = chat_id
 
     events = await get_all_events()
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = datetime.now().strftime(ISO_FMT)
     upcoming_events = [ev for ev in events if ev[3] >= now_str]
 
     if not upcoming_events:
@@ -153,9 +179,9 @@ async def show_events_list(target) -> None:
     await bot.send_message(chat_id, "События:", reply_markup=events_inline_kb(upcoming_events))
 
 async def schedule_reminders_for_event(ev_id: int, name: str, dt_str: str, place: str):
-    """Планирует напоминания за 24 часа и за 2 часа до события."""
+    """Планирует напоминания за 24 часа и за 2 часа до события (оставлено как было)."""
     try:
-        ev_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+        ev_dt = datetime.strptime(dt_str, ISO_FMT)
     except Exception:
         return
     now = datetime.now()
@@ -175,7 +201,6 @@ async def schedule_reminders_for_event(ev_id: int, name: str, dt_str: str, place
             send_event_reminder(eid, nm, d, pl, 2)
         ))
 
-
 # -----------------------------
 # КОМАНДЫ: /start, /help, /whoami, /admin
 # -----------------------------
@@ -184,7 +209,10 @@ async def cmd_start(message: types.Message):
     reset_user_state(message.from_user.id)
     reset_admin_states(message.from_user.id)
     await message.answer(
-        "Привет! Я бот для записи на мероприятия NORD Coffee Base 💚\nЯ помогу выбрать мероприятие, дату, время, узнать стоимость и записаться 📝\nВажно ☝️ Места бронируются только после предоплаты — с вами дополнительно свяжутся.\nВыберите действие в меню ниже:",
+        "Привет! Я бот для записи на мероприятия NORD Coffee Base 💚\n"
+        "Я помогу выбрать мероприятие, дату, время, узнать стоимость и записаться 📝\n"
+        "Важно ☝️ Места бронируются только после предоплаты — с вами дополнительно свяжутся.\n"
+        "Выберите действие в меню ниже:",
         reply_markup=main_menu_kb()
     )
 
@@ -198,7 +226,6 @@ async def cmd_admin(message: types.Message):
         return await message.reply("Эта команда доступна только администраторам.")
     reset_admin_states(message.from_user.id)
     await message.answer("Режим администрирования:\nВыберите действие.", reply_markup=admin_menu_kb())
-
 
 # -----------------------------
 # ПОЛЬЗОВАТЕЛЬСКИЙ ФЛОУ
@@ -217,7 +244,7 @@ async def go_back(message: types.Message):
             return await message.answer("Режим администрирования:\nВыберите действие.", reply_markup=admin_menu_kb())
 
     st = user_states.get(uid)
-    if st and st.get('step') in (STEP_NAME, STEP_PHONE, STEP_EVENT):
+    if st and st.get('step') in (STEP_NAME, STEP_SEATS, STEP_PHONE, STEP_EVENT):
         return await show_events_list(message.chat.id)
     await message.answer("Возвращаемся в главное меню.", reply_markup=main_menu_kb())
 
@@ -250,7 +277,7 @@ async def choose_event_fallback(message: types.Message):
         return await message.reply("Пожалуйста, выберите мероприятие из списка кнопок.")
 
     ev_id, ev_name, ev_desc, ev_dt, ev_place = chosen_event
-    lines = [f"🗓 {ev_name}", f"• Дата/время: {ev_dt}", f"• Место: {ev_place or '(не указано)'}"]
+    lines = [f"🗓 {ev_name}", f"• Дата/время: {iso_to_disp(ev_dt)}", f"• Место: {ev_place or '(не указано)'}"]
     if ev_desc:
         lines.append(f"• Описание: {ev_desc}")
     await message.answer("\n".join(lines), reply_markup=details_inline_kb(ev_id))
@@ -268,7 +295,7 @@ async def show_event_details_cb(call: types.CallbackQuery):
         return await call.answer("Событие не найдено.", show_alert=True)
 
     ev_id, ev_name, ev_desc, ev_dt, ev_place = ev
-    lines = [f"🗓 {ev_name}", f"• Дата/время: {ev_dt}", f"• Место: {ev_place or '(не указано)'}"]
+    lines = [f"🗓 {ev_name}", f"• Дата/время: {iso_to_disp(ev_dt)}", f"• Место: {ev_place or '(не указано)'}"]
     if ev_desc:
         lines.append(f"• Описание: {ev_desc}")
     await call.message.answer("\n".join(lines), reply_markup=details_inline_kb(ev_id))
@@ -301,7 +328,7 @@ async def signup_cb(call: types.CallbackQuery):
     await call.message.answer(f"Отлично! Вы выбрали: \"{ev_name}\"\nКак вас зовут?", reply_markup=back_cancel_kb())
     await call.answer()
 
-# Шаги записи: имя -> телефон
+# Шаги записи: имя -> места -> телефон
 @dp.message_handler(lambda m: user_states.get(m.from_user.id, {}).get('step') == STEP_NAME)
 async def step_name(message: types.Message):
     if message.text == BTN_BACK:
@@ -311,17 +338,38 @@ async def step_name(message: types.Message):
 
     name = message.text.strip()
     user_states[message.from_user.id]['name'] = name
+    user_states[message.from_user.id]['step'] = STEP_SEATS
+    await message.answer("Сколько мест бронируете?\nВыберите 1–4:", reply_markup=seats_kb())
+
+@dp.message_handler(lambda m: user_states.get(m.from_user.id, {}).get('step') == STEP_SEATS)
+async def step_seats(message: types.Message):
+    if message.text == BTN_BACK:
+        user_states[message.from_user.id]['step'] = STEP_NAME
+        return await message.answer("Как вас зовут?", reply_markup=back_cancel_kb())
+    if message.text == BTN_CANCEL:
+        return await cancel_everything(message)
+
+    try:
+        seats = int(message.text.strip())
+    except Exception:
+        return await message.answer("Пожалуйста, выберите число от 1 до 4 кнопкой ниже.", reply_markup=seats_kb())
+
+    if seats < 1 or seats > 4:
+        return await message.answer("Можно выбрать от 1 до 4 мест.", reply_markup=seats_kb())
+
+    user_states[message.from_user.id]['seats'] = seats
     user_states[message.from_user.id]['step'] = STEP_PHONE
-    await message.answer("Укажите ваш номер телефона или имя пользователя Telegram для подтверждения записи:", reply_markup=phone_request_kb())
+    await message.answer("Укажите ваш номер телефона или @username:", reply_markup=phone_request_kb())
 
 @dp.message_handler(lambda m: user_states.get(m.from_user.id, {}).get('step') == STEP_PHONE,
                     content_types=[ContentType.TEXT, ContentType.CONTACT])
 async def step_phone(message: types.Message):
+    # обработка навигации
     if message.content_type == ContentType.TEXT:
         if message.text == BTN_BACK:
-            st = user_states.get(message.from_user.id, {})
-            st['step'] = STEP_NAME
-            return await message.answer("Как вас зовут?", reply_markup=back_cancel_kb())
+            user_states[message.from_user.id]['step'] = STEP_SEATS if 'seats' in user_states.get(message.from_user.id, {}) else STEP_NAME
+            return await message.answer("Сколько мест бронируете? (1–4)" if user_states[message.from_user.id]['step'] != STEP_NAME else "Как вас зовут?",
+                                        reply_markup=seats_kb() if user_states[message.from_user.id]['step'] != STEP_NAME else back_cancel_kb())
         if message.text == BTN_CANCEL:
             return await cancel_everything(message)
 
@@ -329,9 +377,23 @@ async def step_phone(message: types.Message):
     if not st:
         return await message.answer("Сессия сброшена. Начните заново.", reply_markup=main_menu_kb())
 
-    phone = message.contact.phone_number if (message.content_type == ContentType.CONTACT and message.contact) else message.text.strip()
+    # получаем значение контакта: номер / @username / текст
+    if message.content_type == ContentType.CONTACT and message.contact:
+        contact_value = message.contact.phone_number
+    elif message.content_type == ContentType.TEXT and message.text == BTN_SEND_USERNAME:
+        uname = message.from_user.username
+        if not uname:
+            return await message.answer(
+                "У вас не установлен @username в Telegram. Укажите его в настройках или введите номер/ник вручную:",
+                reply_markup=phone_request_kb()
+            )
+        contact_value = f"@{uname}"
+    else:
+        contact_value = message.text.strip()
+
     event_id = st.get('event_id')
     name = st.get('name')
+    seats = st.get('seats', 1)
 
     # защита от дубля
     registrations = await get_registrations_by_event(event_id)
@@ -339,28 +401,29 @@ async def step_phone(message: types.Message):
         reset_user_state(message.from_user.id)
         return await message.answer("Вы уже записаны на это мероприятие.", reply_markup=main_menu_kb())
 
-    await add_registration(event_id, message.from_user.id, name, phone)
+    # запись в БД (колонка seats уже есть)
+    await add_registration(event_id, message.from_user.id, name, contact_value, seats)
 
     # уведомления админам
     for admin_id in ADMINS:
         try:
             await bot.send_message(
                 admin_id,
-                f"💥 Новая запись на мероприятие:\n"
+                "💥 Новая запись на мероприятие:\n"
                 f"• Мероприятие: {st.get('event_name')}\n"
                 f"• Имя: {name}\n"
-                f"• Телефон: {phone}"
+                f"• Контакт: {contact_value}\n"
+                f"• Мест: {seats}"
             )
         except Exception as e:
             logging.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
 
     reset_user_state(message.from_user.id)
     await message.answer(
-        f"Спасибо, {name}! Вы зарегистрированы на \"{st.get('event_name')}\".\n"
+        f"Спасибо, {name}! Вы зарегистрированы на \"{st.get('event_name')}\" (мест: {seats}).\n"
         "Администратор свяжется с вами в ближайшее время для подтверждения бронирования.",
         reply_markup=main_menu_kb()
     )
-
 
 # -----------------------------
 # «МОИ ЗАПИСИ» и отмена
@@ -373,16 +436,18 @@ async def user_list_registrations(message: types.Message):
     for ev in events:
         ev_id, name, desc, dt, place = ev
         regs = await get_registrations_by_event(ev_id)
-        if any(reg[0] == user_id for reg in regs):
-            user_regs.append((ev_id, name, dt, place))
+        for reg in regs:
+            if reg[0] == user_id:
+                seats = reg_seats_safe(reg)
+                user_regs.append((ev_id, name, dt, place, seats))
 
     if not user_regs:
         return await message.answer("📭 У вас пока нет записей.", reply_markup=main_menu_kb())
 
     lines = ["Ваши записи:"]
     kb_inline = InlineKeyboardMarkup()
-    for idx, (ev_id, ev_name, ev_dt, ev_place) in enumerate(user_regs, start=1):
-        lines.append(f"{idx}. {ev_name} – {ev_dt} @ {ev_place or '(место не указано)'}")
+    for idx, (ev_id, ev_name, ev_dt, ev_place, seats) in enumerate(user_regs, start=1):
+        lines.append(f"{idx}. {ev_name} – {iso_to_disp(ev_dt)} @ {ev_place or '(место не указано)'} — мест: {seats}")
         kb_inline.add(InlineKeyboardButton(f"❌ Отмена {idx}", callback_data=f"{CB_CANCEL_REG}:{ev_id}"))
     await message.answer("\n".join(lines), reply_markup=myregs_back_kb())
     await message.answer("Для отмены записи нажмите кнопку под соответствующим пунктом:", reply_markup=kb_inline)
@@ -404,16 +469,18 @@ async def cancel_registration_callback(call: types.CallbackQuery):
 
     if ev and this_reg:
         _, ev_name, _, ev_dt, ev_place = ev
-        _, reg_name, reg_phone = this_reg
+        _, reg_name, reg_phone = this_reg[0:3]
+        seats = reg_seats_safe(this_reg)
         # уведомление админам
         for admin_id in ADMINS:
             try:
                 await bot.send_message(
                     admin_id,
                     "❎ Отмена записи:\n"
-                    f"• Мероприятие: {ev_name} ({ev_dt}, {ev_place or 'место не указано'})\n"
+                    f"• Мероприятие: {ev_name} ({iso_to_disp(ev_dt)}, {ev_place or 'место не указано'})\n"
                     f"• Имя: {reg_name}\n"
-                    f"• Телефон: {reg_phone}"
+                    f"• Телефон: {reg_phone}\n"
+                    f"• Мест: {seats}"
                 )
             except Exception as e:
                 logging.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
@@ -424,8 +491,9 @@ async def cancel_registration_callback(call: types.CallbackQuery):
     for ev2 in events:
         e_id, name, desc, dt, place = ev2
         rs = await get_registrations_by_event(e_id)
-        if any(r[0] == user_id for r in rs):
-            still.append((e_id, name, dt, place))
+        for r in rs:
+            if r[0] == user_id:
+                still.append((e_id, name, dt, place, reg_seats_safe(r)))
 
     try:
         await call.message.edit_reply_markup()
@@ -437,14 +505,13 @@ async def cancel_registration_callback(call: types.CallbackQuery):
     else:
         lines = ["Ваши записи:"]
         kb_inline = InlineKeyboardMarkup()
-        for idx, (e_id, ev_name2, ev_dt2, ev_place2) in enumerate(still, start=1):
-            lines.append(f"{idx}. {ev_name2} – {ev_dt2} @ {ev_place2 or '(место не указано)'}")
+        for idx, (e_id, ev_name2, ev_dt2, ev_place2, seats2) in enumerate(still, start=1):
+            lines.append(f"{idx}. {ev_name2} – {iso_to_disp(ev_dt2)} @ {ev_place2 or '(место не указано)'} — мест: {seats2}")
             kb_inline.add(InlineKeyboardButton(f"❌ Отмена {idx}", callback_data=f"{CB_CANCEL_REG}:{e_id}"))
         await bot.send_message(user_id, "\n".join(lines), reply_markup=myregs_back_kb())
         await bot.send_message(user_id, "Для отмены записи нажмите кнопку под соответствующим пунктом:", reply_markup=kb_inline)
 
     await call.answer("Запись отменена.")
-
 
 # -----------------------------
 # АДМИН: список участников / добавление / удаление
@@ -459,14 +526,18 @@ async def admin_list_participants(message: types.Message):
     lines = ["📋 Список участников на каждое мероприятие:"]
     for ev in events:
         ev_id, name, desc, dt, place = ev
-        lines.append(f"*{name}* ({dt}, {place or 'место не указано'})")
+        lines.append(f"*{name}* ({iso_to_disp(dt)}, {place or 'место не указано'})")
         regs = await get_registrations_by_event(ev_id)
+        total = 0
         if regs:
             for reg in regs:
-                _, reg_name, reg_phone = reg
-                lines.append(f"   • {reg_name} — {reg_phone}")
+                _, reg_name, reg_phone = reg[0:3]
+                seats = reg_seats_safe(reg)
+                total += seats
+                lines.append(f"   • {reg_name} — {reg_phone} (мест: {seats})")
         else:
             lines.append("   (нет записей)")
+        lines.append(f"   Итого мест: {total}")
         lines.append("")
     if lines[-1] == "":
         lines.pop()
@@ -503,11 +574,11 @@ async def admin_add_datetime(message: types.Message):
 
     dt_text = message.text.strip()
     try:
-        dt_parsed = datetime.strptime(dt_text, "%Y-%m-%d %H:%M")
+        dt_parsed = datetime.strptime(dt_text, ISO_FMT)
     except Exception:
         return await message.answer("❗ Неверный формат. Введите YYYY-MM-DD HH:MM:", reply_markup=back_cancel_kb())
 
-    add_states[message.from_user.id]['date_time'] = dt_parsed.strftime("%Y-%m-%d %H:%M")
+    add_states[message.from_user.id]['date_time'] = dt_parsed.strftime(ISO_FMT)
     add_states[message.from_user.id]['step'] = ADMIN_ADD_PLACE
     await message.answer("Введите место проведения:", reply_markup=back_cancel_kb())
 
@@ -544,13 +615,13 @@ async def admin_add_description(message: types.Message):
 
     await message.answer(
         f"✅ Событие \"{st['title']}\" создано:\n"
-        f" • Дата/время: {st['date_time']}\n"
+        f" • Дата/время: {iso_to_disp(st['date_time'])}\n"
         f" • Место: {st['place'] or '(не указано)'}\n"
         f" • Описание: {desc_text or '(не указано)'}",
         reply_markup=admin_menu_kb()
     )
 
-    # Планируем напоминания для созданного события
+    # Планируем напоминания для созданного события (оставлено как было)
     try:
         events = await get_all_events()
         new_ev = max(events, key=lambda e: e[0])  # новое — с максимальным id
@@ -568,7 +639,7 @@ async def admin_delete_event_menu(message: types.Message):
     if not events:
         delete_states.pop(message.from_user.id, None)
         return await message.answer("Нет мероприятий для удаления.", reply_markup=admin_menu_kb())
-    lst = "\n".join([f"{ev[0]}. {ev[1]} ({ev[3]})" for ev in events])
+    lst = "\n".join([f"{ev[0]}. {ev[1]} ({iso_to_disp(ev[3])})" for ev in events])
     await message.answer("Введите ID мероприятия, которое нужно удалить:\n" + lst, reply_markup=back_cancel_kb())
 
 @dp.message_handler(lambda m: delete_states.get(m.from_user.id, {}).get('step') == ADMIN_DEL_WAIT_ID)
@@ -616,9 +687,8 @@ async def admin_delete_event_confirm(message: types.Message):
     await delete_event(event_id)
     await message.answer("🗑 Готово. Мероприятие и все связанные записи удалены.", reply_markup=admin_menu_kb())
 
-
 # -----------------------------
-# НАПОМИНАНИЯ
+# НАПОМИНАНИЯ (как было у тебя)
 # -----------------------------
 async def send_event_reminder(event_id: int, event_name: str, event_datetime: datetime, place: str, hours_before: int):
     regs = await get_registrations_by_event(event_id)
@@ -632,12 +702,11 @@ async def send_event_reminder(event_id: int, event_name: str, event_datetime: da
     else:
         text = f"🔔 Скоро начнется \"{event_name}\"."
     for reg in regs:
-        user_id, _, _ = reg
+        user_id = reg[0]
         try:
             await bot.send_message(user_id, text)
         except Exception as e:
             logging.warning(f"Не удалось отправить напоминание пользователю {user_id}: {e}")
-
 
 # -----------------------------
 # СТАРТ
