@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import html  # для экранирования в HTML
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, types
@@ -140,6 +141,29 @@ def myregs_back_kb() -> ReplyKeyboardMarkup:
 # -----------------------------
 # HELPERS
 # -----------------------------
+def esc(s: str) -> str:
+    """Экранируем текст для HTML parse_mode."""
+    return html.escape(s or "")
+
+async def send_lines_html(message: types.Message, lines, reply_markup=None):
+    """
+    Безопасно отправляет большой список в нескольких сообщениях (HTML parse_mode).
+    """
+    max_len = 4000  # запас к лимиту 4096
+    buf = ""
+    first = True
+    for line in lines:
+        part = (("\n" if buf else "") + line)
+        if len(buf) + len(part) > max_len:
+            await message.answer(buf, parse_mode="HTML",
+                                 reply_markup=reply_markup if first else None)
+            first = False
+            buf = line
+        else:
+            buf += part
+    if buf:
+        await message.answer(buf, parse_mode="HTML",
+                             reply_markup=reply_markup if first else None)
 def reset_user_state(user_id: int):
     user_states.pop(user_id, None)
 
@@ -523,25 +547,30 @@ async def admin_list_participants(message: types.Message):
     events = await get_all_events()
     if not events:
         return await message.answer("📭 Событий пока нет.", reply_markup=admin_menu_kb())
-    lines = ["📋 Список участников на каждое мероприятие:"]
+
+    lines = ["<b>📋 Список участников на каждое мероприятие:</b>"]
     for ev in events:
         ev_id, name, desc, dt, place = ev
-        lines.append(f"*{name}* ({iso_to_disp(dt)}, {place or 'место не указано'})")
+        lines.append(f"<b>{esc(name)}</b> ({iso_to_disp(dt)}, {esc(place) if place else 'место не указано'})")
         regs = await get_registrations_by_event(ev_id)
         total = 0
         if regs:
             for reg in regs:
-                _, reg_name, reg_phone = reg[0:3]
-                seats = reg_seats_safe(reg)
+                # поддерживаем схему с seats (если есть)
+                _, reg_name, reg_contact = reg[0:3]
+                try:
+                    seats = int(reg[3])
+                except Exception:
+                    seats = 1
                 total += seats
-                lines.append(f"   • {reg_name} — {reg_phone} (мест: {seats})")
+                # Контакт в <code> — подчёркивания не сломают формат
+                lines.append(f"• {esc(reg_name)} — <code>{esc(reg_contact)}</code> (мест: {seats})")
         else:
-            lines.append("   (нет записей)")
-        lines.append(f"   Итого мест: {total}")
-        lines.append("")
-    if lines[-1] == "":
-        lines.pop()
-    await message.answer("\n".join(lines), parse_mode='Markdown', reply_markup=admin_menu_kb())
+            lines.append("• (нет записей)")
+        lines.append(f"Итого мест: {total}")
+        lines.append("")  # пустая строка-разделитель
+
+    await send_lines_html(message, lines, reply_markup=admin_menu_kb())
 
 @dp.message_handler(lambda m: m.text == "➕ Добавить мероприятие")
 async def admin_add_event_menu(message: types.Message):
