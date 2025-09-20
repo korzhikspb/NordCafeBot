@@ -1,8 +1,7 @@
 import os
 import logging
-import asyncio
 import html  # для экранирования в HTML
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import (
@@ -201,29 +200,6 @@ async def show_events_list(target) -> None:
     user_states[uid] = {'step': STEP_EVENT, 'events': upcoming_events}
     await bot.send_message(chat_id, "Выберите мероприятие из списка:", reply_markup=back_cancel_kb())
     await bot.send_message(chat_id, "События:", reply_markup=events_inline_kb(upcoming_events))
-
-async def schedule_reminders_for_event(ev_id: int, name: str, dt_str: str, place: str):
-    """Планирует напоминания за 24 часа и за 2 часа до события (оставлено как было)."""
-    try:
-        ev_dt = datetime.strptime(dt_str, ISO_FMT)
-    except Exception:
-        return
-    now = datetime.now()
-    loop = asyncio.get_running_loop()
-    # 24 часа
-    remind_24 = ev_dt - timedelta(hours=24)
-    if remind_24 > now:
-        delay1 = (remind_24 - now).total_seconds()
-        loop.call_later(delay1, lambda eid=ev_id, nm=name, d=ev_dt, pl=place: asyncio.create_task(
-            send_event_reminder(eid, nm, d, pl, 24)
-        ))
-    # 2 часа
-    remind_2 = ev_dt - timedelta(hours=2)
-    if remind_2 > now:
-        delay2 = (remind_2 - now).total_seconds()
-        loop.call_later(delay2, lambda eid=ev_id, nm=name, d=ev_dt, pl=place: asyncio.create_task(
-            send_event_reminder(eid, nm, d, pl, 2)
-        ))
 
 # -----------------------------
 # КОМАНДЫ: /start, /help, /whoami, /admin
@@ -650,15 +626,6 @@ async def admin_add_description(message: types.Message):
         reply_markup=admin_menu_kb()
     )
 
-    # Планируем напоминания для созданного события (оставлено как было)
-    try:
-        events = await get_all_events()
-        new_ev = max(events, key=lambda e: e[0])  # новое — с максимальным id
-        ev_id, name, description, dt_str, place = new_ev
-        await schedule_reminders_for_event(ev_id, name, dt_str, place)
-    except Exception as e:
-        logging.error(f"Ошибка планирования напоминаний: {e}")
-
 @dp.message_handler(lambda m: m.text == "❌ Удалить мероприятие")
 async def admin_delete_event_menu(message: types.Message):
     if message.from_user.id not in ADMINS:
@@ -716,26 +683,6 @@ async def admin_delete_event_confirm(message: types.Message):
     await delete_event(event_id)
     await message.answer("🗑 Готово. Мероприятие и все связанные записи удалены.", reply_markup=admin_menu_kb())
 
-# -----------------------------
-# НАПОМИНАНИЯ (как было у тебя)
-# -----------------------------
-async def send_event_reminder(event_id: int, event_name: str, event_datetime: datetime, place: str, hours_before: int):
-    regs = await get_registrations_by_event(event_id)
-    if not regs:
-        return
-    if hours_before == 24:
-        time_str = event_datetime.strftime("%H:%M")
-        text = f"🔔 Напоминаем, что завтра в {time_str} состоится \"{event_name}\" по адресу {place}."
-    elif hours_before == 2:
-        text = f"🔔 Напоминаем, что через 2 часа начнется \"{event_name}\" по адресу {place}."
-    else:
-        text = f"🔔 Скоро начнется \"{event_name}\"."
-    for reg in regs:
-        user_id = reg[0]
-        try:
-            await bot.send_message(user_id, text)
-        except Exception as e:
-            logging.warning(f"Не удалось отправить напоминание пользователю {user_id}: {e}")
 
 # -----------------------------
 # СТАРТ
@@ -743,11 +690,6 @@ async def send_event_reminder(event_id: int, event_name: str, event_datetime: da
 async def on_startup(dp):
     await init_db()
     logging.info("База данных готова, бот запущен.")
-    # Планируем напоминания для всех будущих событий
-    events = await get_all_events()
-    for ev in events:
-        ev_id, name, desc, dt_str, place = ev
-        await schedule_reminders_for_event(ev_id, name, dt_str, place)
 
 if __name__ == "__main__":
     executor.start_polling(dp, on_startup=on_startup)
