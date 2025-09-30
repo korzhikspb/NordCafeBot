@@ -3,9 +3,10 @@ import aiosqlite
 DB_PATH = 'registrations.db'
 
 async def init_db():
-    """Инициализация БД и мягкая миграция для столбца seats."""
+    """Инициализация БД и мягкие миграции (seats, open_at)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA foreign_keys = ON;")
+
         # События
         await db.execute("""
             CREATE TABLE IF NOT EXISTS events (
@@ -17,6 +18,7 @@ async def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
         # Регистрации
         await db.execute("""
             CREATE TABLE IF NOT EXISTS registrations (
@@ -29,17 +31,32 @@ async def init_db():
                 FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
             )
         """)
-        # Миграция: добавить seats при отсутствии
+
+        # --- миграции ---
+        # seats в registrations
         seats_exists = False
         async with db.execute("PRAGMA table_info(registrations)") as cur:
             cols = await cur.fetchall()
             for c in cols:
-                # c = (cid, name, type, notnull, dflt_value, pk)
                 if c[1] == "seats":
                     seats_exists = True
                     break
         if not seats_exists:
             await db.execute("ALTER TABLE registrations ADD COLUMN seats INTEGER DEFAULT 1")
+
+        # open_at в events
+        open_exists = False
+        async with db.execute("PRAGMA table_info(events)") as cur:
+            cols = await cur.fetchall()
+            for c in cols:
+                if c[1] == "open_at":
+                    open_exists = True
+                    break
+        if not open_exists:
+            await db.execute("ALTER TABLE events ADD COLUMN open_at TEXT")
+            # старым событиям открываем сразу (open_at = date_time)
+            await db.execute("UPDATE events SET open_at = date_time WHERE open_at IS NULL")
+
         await db.commit()
 
 async def add_registration(event_id: int, user_id: int, name: str, phone: str, seats: int = 1):
@@ -51,17 +68,17 @@ async def add_registration(event_id: int, user_id: int, name: str, phone: str, s
         )
         await db.commit()
 
-async def create_event(name: str, description: str, date_time: str, place: str):
-    """Добавить новое мероприятие."""
+async def create_event(name: str, description: str, date_time: str, place: str, open_at: str | None = None):
+    """Добавить новое мероприятие. open_at — время открытия регистрации (если None, открыто сразу)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO events (name, description, date_time, place) VALUES (?, ?, ?, ?)",
-            (name, description, date_time, place)
+            "INSERT INTO events (name, description, date_time, place, open_at) VALUES (?, ?, ?, ?, ?)",
+            (name, description, date_time, place, open_at or date_time)
         )
         await db.commit()
 
 async def get_all_events():
-    """Список всех мероприятий (сортировка по дате-времени)."""
+    """Список всех мероприятий (для админов)."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, name, description, date_time, place FROM events "
@@ -69,11 +86,26 @@ async def get_all_events():
         )
         return await cursor.fetchall()
 
-async def get_event_by_id(event_id: int):
-    """Мероприятие по ID."""
+async def get_visible_events(now_iso: str):
+    """
+    Список событий, видимых пользователю:
+      - событие не в прошлом (date_time >= now_iso)
+      - open_at наступил (open_at <= now_iso) или NULL
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, name, description, date_time, place FROM events WHERE id = ?",
+            "SELECT id, name, description, date_time, place FROM events "
+            "WHERE date_time >= ? AND (open_at IS NULL OR open_at <= ?) "
+            "ORDER BY date(date_time), time(date_time)",
+            (now_iso, now_iso)
+        )
+        return await cursor.fetchall()
+
+async def get_event_by_id(event_id: int):
+    """Мероприятие по ID (возвращает и open_at шестой колонкой)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, name, description, date_time, place, open_at FROM events WHERE id = ?",
             (event_id,)
         )
         return await cursor.fetchone()

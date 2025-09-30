@@ -1,7 +1,7 @@
 import os
 import logging
 import html  # для экранирования в HTML
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import (
@@ -14,7 +14,8 @@ from dotenv import load_dotenv
 
 from database import (
     init_db, add_registration, create_event, get_all_events, get_event_by_id,
-    delete_event, delete_registrations_for_event, get_registrations_by_event, delete_registration
+    delete_event, delete_registrations_for_event, get_registrations_by_event, delete_registration,
+    get_visible_events  # NEW
 )
 
 # -----------------------------
@@ -43,17 +44,22 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
 # -----------------------------
-# ФОРМАТЫ ДАТ/ВРЕМЕНИ
+# ВРЕМЯ/ФОРМАТЫ (GMT+4)
 # -----------------------------
 ISO_FMT = "%Y-%m-%d %H:%M"   # как хранится в БД
 DISP_FMT = "%H:%M %d.%m"     # как показываем пользователю (без года)
+LOCAL_TZ = timezone(timedelta(hours=4))  # GMT+4
+
+def now_local_iso() -> str:
+    """Текущее время в GMT+4 в формате БД (строка)."""
+    return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ).strftime(ISO_FMT)
 
 def iso_to_disp(iso_str: str) -> str:
-    """YYYY-MM-DD HH:MM -> HH:MM DD.MM"""
+    """YYYY-MM-DD HH:MM -> HH:MM DD.MM (без года)"""
     try:
         return datetime.strptime(iso_str, ISO_FMT).strftime(DISP_FMT)
     except Exception:
-        return iso_str  # на всякий случай, если формат неожиданный
+        return iso_str  # fallback
 
 # -----------------------------
 # ТЕКСТЫ КНОПОК
@@ -74,10 +80,11 @@ CB_SIGNUP     = "su"       # su:<event_id> — начало записи
 CB_CANCEL_REG = "cancel"   # cancel:<event_id> — отмена записи
 
 # -----------------------------
-# "Состояния" простыми словарями
+# "Состояния"
 # -----------------------------
 STEP_EVENT, STEP_NAME, STEP_SEATS, STEP_PHONE = range(4)
-ADMIN_ADD_TITLE, ADMIN_ADD_DATETIME, ADMIN_ADD_PLACE, ADMIN_ADD_DESC = range(4)
+# добавили шаг ADMIN_ADD_OPEN_AT
+ADMIN_ADD_TITLE, ADMIN_ADD_DATETIME, ADMIN_ADD_OPEN_AT, ADMIN_ADD_PLACE, ADMIN_ADD_DESC = range(5)
 ADMIN_DEL_WAIT_ID, ADMIN_DEL_CONFIRM = range(2)
 
 user_states = {}    # per-user: запись на событие
@@ -126,9 +133,12 @@ def events_inline_kb(events) -> InlineKeyboardMarkup:
         kb.add(InlineKeyboardButton(title, callback_data=f"{CB_EVENT}:{ev_id}"))
     return kb
 
-def details_inline_kb(event_id: int) -> InlineKeyboardMarkup:
+def details_inline_kb(event_id: int, is_open: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("✅ Записаться", callback_data=f"{CB_SIGNUP}:{event_id}"))
+    if is_open:
+        kb.add(InlineKeyboardButton("✅ Записаться", callback_data=f"{CB_SIGNUP}:{event_id}"))
+    else:
+        kb.add(InlineKeyboardButton("⏳ Регистрация ещё не открыта", callback_data="noop"))
     kb.add(InlineKeyboardButton("⬅️ К списку", callback_data=CB_EVENT_LIST))
     return kb
 
@@ -145,10 +155,8 @@ def esc(s: str) -> str:
     return html.escape(s or "")
 
 async def send_lines_html(message: types.Message, lines, reply_markup=None):
-    """
-    Безопасно отправляет большой список в нескольких сообщениях (HTML parse_mode).
-    """
-    max_len = 4000  # запас к лимиту 4096
+    """Отправляет большой список частями (HTML parse_mode)."""
+    max_len = 4000
     buf = ""
     first = True
     for line in lines:
@@ -163,6 +171,7 @@ async def send_lines_html(message: types.Message, lines, reply_markup=None):
     if buf:
         await message.answer(buf, parse_mode="HTML",
                              reply_markup=reply_markup if first else None)
+
 def reset_user_state(user_id: int):
     user_states.pop(user_id, None)
 
@@ -179,7 +188,7 @@ def reg_seats_safe(reg_tuple) -> int:
 
 async def show_events_list(target) -> None:
     """
-    Показать список будущих мероприятий (текст + инлайн кнопки).
+    Показать список будущих и уже открытых для регистрации мероприятий (инлайн-кнопки).
     target: types.Message ИЛИ chat_id (int)
     """
     if isinstance(target, types.Message):
@@ -189,9 +198,8 @@ async def show_events_list(target) -> None:
         chat_id = int(target)
         uid = chat_id
 
-    events = await get_all_events()
-    now_str = datetime.now().strftime(ISO_FMT)
-    upcoming_events = [ev for ev in events if ev[3] >= now_str]
+    now_str = now_local_iso()
+    upcoming_events = await get_visible_events(now_str)
 
     if not upcoming_events:
         await bot.send_message(chat_id, "📭 В настоящее время нет доступных мероприятий.", reply_markup=main_menu_kb())
@@ -280,7 +288,7 @@ async def choose_event_fallback(message: types.Message):
     lines = [f"🗓 {ev_name}", f"• Дата/время: {iso_to_disp(ev_dt)}", f"• Место: {ev_place or '(не указано)'}"]
     if ev_desc:
         lines.append(f"• Описание: {ev_desc}")
-    await message.answer("\n".join(lines), reply_markup=details_inline_kb(ev_id))
+    await message.answer("\n".join(lines), reply_markup=details_inline_kb(ev_id, True))  # True — эти события уже открыты
 
 # Инлайн: карточка события
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith(f"{CB_EVENT}:"))
@@ -294,18 +302,25 @@ async def show_event_details_cb(call: types.CallbackQuery):
     if not ev:
         return await call.answer("Событие не найдено.", show_alert=True)
 
-    ev_id, ev_name, ev_desc, ev_dt, ev_place = ev
+    # id, name, description, date_time, place, open_at
+    ev_id, ev_name, ev_desc, ev_dt, ev_place = ev[:5]
+    open_at = ev[5] if len(ev) > 5 else None
+
+    now_str = now_local_iso()
+    is_open = (open_at is None) or (open_at <= now_str)
+
     lines = [f"🗓 {ev_name}", f"• Дата/время: {iso_to_disp(ev_dt)}", f"• Место: {ev_place or '(не указано)'}"]
     if ev_desc:
         lines.append(f"• Описание: {ev_desc}")
-    await call.message.answer("\n".join(lines), reply_markup=details_inline_kb(ev_id))
+    if not is_open and open_at:
+        lines.append(f"⏳ Регистрация откроется: {iso_to_disp(open_at)} (GMT+4)")
+
+    await call.message.answer("\n".join(lines), reply_markup=details_inline_kb(ev_id, is_open))
     await call.answer()
 
-# Инлайн: назад к списку
-@dp.callback_query_handler(lambda c: c.data == CB_EVENT_LIST)
-async def back_to_event_list_cb(call: types.CallbackQuery):
-    await show_events_list(call.message.chat.id)
-    await call.answer()
+@dp.callback_query_handler(lambda c: c.data == "noop")
+async def noop_cb(call: types.CallbackQuery):
+    await call.answer("Регистрация ещё не открыта.", show_alert=True)
 
 # Инлайн: начать запись
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith(f"{CB_SIGNUP}:"))
@@ -319,11 +334,15 @@ async def signup_cb(call: types.CallbackQuery):
     if not ev:
         return await call.answer("Событие не найдено.", show_alert=True)
 
+    open_at = ev[5] if len(ev) > 5 else None
+    if open_at and open_at > now_local_iso():
+        return await call.answer("Регистрация на это мероприятие ещё не открыта.", show_alert=True)
+
     regs = await get_registrations_by_event(event_id)
     if any(reg[0] == call.from_user.id for reg in regs):
         return await call.answer("Вы уже записаны на это мероприятие.", show_alert=True)
 
-    ev_id, ev_name, ev_desc, ev_dt, ev_place = ev
+    ev_id, ev_name, ev_desc, ev_dt, ev_place = ev[:5]
     user_states[call.from_user.id] = {'step': STEP_NAME, 'event_id': ev_id, 'event_name': ev_name}
     await call.message.answer(f"Отлично! Вы выбрали: \"{ev_name}\"\nКак вас зовут?", reply_markup=back_cancel_kb())
     await call.answer()
@@ -430,7 +449,7 @@ async def step_phone(message: types.Message):
 # -----------------------------
 @dp.message_handler(lambda m: m.text == BTN_MYREGS)
 async def user_list_registrations(message: types.Message):
-    events = await get_all_events()
+    events = await get_all_events()  # показываем все, где есть записи пользователя
     user_id = message.from_user.id
     user_regs = []
     for ev in events:
@@ -468,7 +487,7 @@ async def cancel_registration_callback(call: types.CallbackQuery):
     await delete_registration(event_id, user_id)
 
     if ev and this_reg:
-        _, ev_name, _, ev_dt, ev_place = ev
+        _, ev_name, _, ev_dt, ev_place = ev[:5]
         _, reg_name, reg_phone = this_reg[0:3]
         seats = reg_seats_safe(this_reg)
         # уведомление админам
@@ -485,7 +504,12 @@ async def cancel_registration_callback(call: types.CallbackQuery):
             except Exception as e:
                 logging.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
 
-    # обновим пользователю список
+    try:
+        await call.message.edit_reply_markup()
+    except Exception:
+        pass
+
+    # Обновим список для пользователя
     events = await get_all_events()
     still = []
     for ev2 in events:
@@ -494,11 +518,6 @@ async def cancel_registration_callback(call: types.CallbackQuery):
         for r in rs:
             if r[0] == user_id:
                 still.append((e_id, name, dt, place, reg_seats_safe(r)))
-
-    try:
-        await call.message.edit_reply_markup()
-    except Exception:
-        pass
 
     if not still:
         await bot.send_message(user_id, "📭 У вас пока нет записей.", reply_markup=main_menu_kb())
@@ -532,20 +551,17 @@ async def admin_list_participants(message: types.Message):
         total = 0
         if regs:
             for reg in regs:
-                # поддерживаем схему с seats (если есть)
                 _, reg_name, reg_contact = reg[0:3]
                 try:
                     seats = int(reg[3])
                 except Exception:
                     seats = 1
                 total += seats
-                # Контакт в <code> — подчёркивания не сломают формат
                 lines.append(f"• {esc(reg_name)} — <code>{esc(reg_contact)}</code> (мест: {seats})")
         else:
             lines.append("• (нет записей)")
         lines.append(f"Итого мест: {total}")
-        lines.append("")  # пустая строка-разделитель
-
+        lines.append("")
     await send_lines_html(message, lines, reply_markup=admin_menu_kb())
 
 @dp.message_handler(lambda m: m.text == "➕ Добавить мероприятие")
@@ -566,7 +582,7 @@ async def admin_add_title(message: types.Message):
 
     add_states[message.from_user.id]['title'] = message.text.strip()
     add_states[message.from_user.id]['step'] = ADMIN_ADD_DATETIME
-    await message.answer("Введите дату и время в формате YYYY-MM-DD HH:MM:", reply_markup=back_cancel_kb())
+    await message.answer("Введите дату и время события в формате YYYY-MM-DD HH:MM (GMT+4):", reply_markup=back_cancel_kb())
 
 @dp.message_handler(lambda m: add_states.get(m.from_user.id, {}).get('step') == ADMIN_ADD_DATETIME)
 async def admin_add_datetime(message: types.Message):
@@ -581,9 +597,38 @@ async def admin_add_datetime(message: types.Message):
     try:
         dt_parsed = datetime.strptime(dt_text, ISO_FMT)
     except Exception:
-        return await message.answer("❗ Неверный формат. Введите YYYY-MM-DD HH:MM:", reply_markup=back_cancel_kb())
+        return await message.answer("❗ Неверный формат. Введите YYYY-MM-DD HH:MM (GMT+4):", reply_markup=back_cancel_kb())
 
     add_states[message.from_user.id]['date_time'] = dt_parsed.strftime(ISO_FMT)
+    add_states[message.from_user.id]['step'] = ADMIN_ADD_OPEN_AT
+    await message.answer(
+        "Введите момент открытия регистрации в формате YYYY-MM-DD HH:MM (GMT+4)\n"
+        "или отправьте «-», чтобы открыть сразу:",
+        reply_markup=back_cancel_kb()
+    )
+
+@dp.message_handler(lambda m: add_states.get(m.from_user.id, {}).get('step') == ADMIN_ADD_OPEN_AT)
+async def admin_add_open_at(message: types.Message):
+    if message.text == BTN_CANCEL:
+        reset_admin_states(message.from_user.id)
+        return await message.answer("Действие отменено.", reply_markup=admin_menu_kb())
+    if message.text == BTN_BACK:
+        add_states[message.from_user.id]['step'] = ADMIN_ADD_DATETIME
+        return await message.answer("Введите дату и время события (YYYY-MM-DD HH:MM, GMT+4):", reply_markup=back_cancel_kb())
+
+    text = message.text.strip()
+    if text in ('-', '—'):
+        open_at_iso = add_states[message.from_user.id]['date_time']  # открыть сразу (как дата события)
+    else:
+        try:
+            open_at_iso = datetime.strptime(text, ISO_FMT).strftime(ISO_FMT)
+        except Exception:
+            return await message.answer(
+                "❗ Неверный формат. Введите YYYY-MM-DD HH:MM (GMT+4) или «-» для открытия сразу:",
+                reply_markup=back_cancel_kb()
+            )
+
+    add_states[message.from_user.id]['open_at'] = open_at_iso
     add_states[message.from_user.id]['step'] = ADMIN_ADD_PLACE
     await message.answer("Введите место проведения:", reply_markup=back_cancel_kb())
 
@@ -593,8 +638,11 @@ async def admin_add_place(message: types.Message):
         reset_admin_states(message.from_user.id)
         return await message.answer("Действие отменено.", reply_markup=admin_menu_kb())
     if message.text == BTN_BACK:
-        add_states[message.from_user.id]['step'] = ADMIN_ADD_DATETIME
-        return await message.answer("Введите дату и время YYYY-MM-DD HH:MM:", reply_markup=back_cancel_kb())
+        add_states[message.from_user.id]['step'] = ADMIN_ADD_OPEN_AT
+        return await message.answer(
+            "Введите момент открытия регистрации (YYYY-MM-DD HH:MM, GMT+4) или «-»:",
+            reply_markup=back_cancel_kb()
+        )
 
     add_states[message.from_user.id]['place'] = message.text.strip()
     add_states[message.from_user.id]['step'] = ADMIN_ADD_DESC
@@ -614,15 +662,23 @@ async def admin_add_description(message: types.Message):
         return await message.answer("Сессия добавления сброшена.", reply_markup=admin_menu_kb())
 
     desc_text = message.text.strip()
-    if desc_text == '-' or desc_text == '':
+    if desc_text in ('-', ''):
         desc_text = ''
-    await create_event(st['title'], desc_text, st['date_time'], st['place'])
+
+    await create_event(
+        st['title'],
+        desc_text,
+        st['date_time'],
+        st['place'],
+        st.get('open_at')
+    )
 
     await message.answer(
         f"✅ Событие \"{st['title']}\" создано:\n"
         f" • Дата/время: {iso_to_disp(st['date_time'])}\n"
         f" • Место: {st['place'] or '(не указано)'}\n"
-        f" • Описание: {desc_text or '(не указано)'}",
+        f" • Описание: {desc_text or '(не указано)'}\n"
+        f" • Открытие регистрации: {iso_to_disp(st.get('open_at') or st['date_time'])} (GMT+4)",
         reply_markup=admin_menu_kb()
     )
 
@@ -642,7 +698,7 @@ async def admin_delete_event_menu(message: types.Message):
 async def admin_delete_event_get_id(message: types.Message):
     if message.text == BTN_CANCEL:
         reset_admin_states(message.from_user.id)
-        return await message.answer("Действие отменено.", reply_markup=admin_menu_kb())
+        return await message.answer("Действие отменено.", reply_markup=admin_menu_kб())
     if message.text == BTN_BACK:
         reset_admin_states(message.from_user.id)
         return await cmd_admin(message)
@@ -682,7 +738,6 @@ async def admin_delete_event_confirm(message: types.Message):
     await delete_registrations_for_event(event_id)
     await delete_event(event_id)
     await message.answer("🗑 Готово. Мероприятие и все связанные записи удалены.", reply_markup=admin_menu_kb())
-
 
 # -----------------------------
 # СТАРТ
